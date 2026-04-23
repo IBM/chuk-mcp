@@ -20,7 +20,7 @@ except (ImportError, AttributeError):
 # Import version-aware batching
 from chuk_mcp.protocol.features.batching import BatchProcessor, supports_batching
 from chuk_mcp.mcp_client.host.environment import get_default_environment
-from chuk_mcp.protocol.messages.json_rpc_message import JSONRPCMessage
+from chuk_mcp.protocol.messages.json_rpc_message import JSONRPCMessage, parse_message
 from .parameters import StdioParameters
 
 __all__ = ["StdioClient", "stdio_client", "stdio_client_with_initialize"]
@@ -76,6 +76,16 @@ class StdioClient:
                 "Streams not initialized. StdioClient must be used as async context manager."
             )
 
+    def _log_shutdown_exc(self, exc: Exception) -> None:
+        """Categorise and log a single exception that surfaced during shutdown."""
+        error_msg = str(exc)
+        if "cancel scope" in error_msg.lower():
+            logger.debug(f"Cancel scope issue during shutdown (expected): {exc}")
+        elif "json object must be str" in error_msg.lower():
+            logger.error(f"JSON serialization error during shutdown: {exc}")
+        else:
+            logger.error(f"Task error during shutdown: {exc}")
+
     def set_protocol_version(self, version: str) -> None:
         """Set the negotiated protocol version and update batching behavior."""
         self.batch_processor.update_protocol_version(version)
@@ -116,15 +126,10 @@ class StdioClient:
 
             return  # Early return - no legacy stream handling needed
 
-        # PERFORMANCE: Check legacy streams first (more specific routing)
-        # Use get() instead of pop() to avoid KeyError and allow dict reuse
         msg_id_str = str(msg_id)
-        legacy_stream = self._pending.get(msg_id_str)
+        legacy_stream = self._pending.pop(msg_id_str, None)
 
         if legacy_stream:
-            # PERFORMANCE: Remove from pending dict only after confirming it exists
-            del self._pending[msg_id_str]
-
             # Send to legacy stream (for backward compatibility with old test patterns)
             try:
                 await legacy_stream.send(msg)
@@ -144,7 +149,8 @@ class StdioClient:
     async def _stdout_reader(self) -> None:
         """Read server stdout and route JSON-RPC messages with version-aware batch support."""
         try:
-            assert self.process and self.process.stdout
+            if not (self.process and self.process.stdout):
+                raise RuntimeError("_stdout_reader called before process was started")
 
             buffer = ""
             logger.debug("stdout_reader started")
@@ -201,11 +207,6 @@ class StdioClient:
                 )
                 for item in data:
                     try:
-                        # Import parse_message to handle unions properly
-                        from chuk_mcp.protocol.messages.json_rpc_message import (
-                            parse_message,
-                        )
-
                         msg = parse_message(item)  # type: ignore[arg-type]
                         await self._route_message(msg)  # type: ignore[arg-type]
                         msg_method = getattr(msg, "method", None)
@@ -224,9 +225,6 @@ class StdioClient:
         else:
             # Single message
             try:
-                # Import parse_message to handle unions properly
-                from chuk_mcp.protocol.messages.json_rpc_message import parse_message
-
                 msg = parse_message(data)  # type: ignore[arg-type]
                 await self._route_message(msg)  # type: ignore[arg-type]
                 msg_method = getattr(msg, "method", None)
@@ -258,7 +256,8 @@ class StdioClient:
         self._ensure_streams_initialized()
 
         try:
-            assert self.process and self.process.stdin
+            if not (self.process and self.process.stdin):
+                raise RuntimeError("_stdin_writer called before process was started")
             logger.debug("stdin_writer started")
 
             async for message in self._outgoing_recv:  # type: ignore[union-attr]
@@ -449,58 +448,21 @@ class StdioClient:
             raise
 
     async def __aexit__(self, exc_type, exc, tb):
-        """COMPLETE FIXED VERSION: Handle shutdown without JSON or cancel scope errors."""
         try:
-            # Close outgoing stream to signal stdin_writer to exit
             if self._outgoing_send:
                 await self._outgoing_send.aclose()
 
             if self.tg:
-                # Cancel all tasks
                 self.tg.cancel_scope.cancel()
-
-                # CRITICAL FIX: Do NOT use asyncio.wait_for() with anyio task groups!
-                # This was causing the "cancel scope in different task" error.
-                # Just handle the BaseExceptionGroup properly.
                 try:
                     await self.tg.__aexit__(None, None, None)
                 except BaseExceptionGroup as eg:
-                    # FIXED: Handle exception groups by changing log levels appropriately
-                    # Cancel scope errors during shutdown are EXPECTED, not actual errors
-                    for exc in eg.exceptions:
-                        if not isinstance(exc, anyio.get_cancelled_exc_class()):
-                            error_msg = str(exc)
-                            if "cancel scope" in error_msg.lower():
-                                # CRITICAL: Log cancel scope issues as DEBUG, not ERROR
-                                # This eliminates the misleading error message
-                                logger.debug(
-                                    f"Cancel scope issue during shutdown (expected): {exc}"
-                                )
-                            elif "json object must be str" in error_msg.lower():
-                                # JSON serialization errors are actual bugs
-                                logger.error(
-                                    f"JSON serialization error during shutdown: {exc}"
-                                )
-                            else:
-                                # Only real errors should be logged as ERROR
-                                logger.error(f"Task error during shutdown: {exc}")
-
+                    for inner in eg.exceptions:
+                        if not isinstance(inner, anyio.get_cancelled_exc_class()):
+                            self._log_shutdown_exc(inner)
                 except Exception as e:
-                    # Handle regular exceptions for older anyio versions
                     if not isinstance(e, anyio.get_cancelled_exc_class()):
-                        error_msg = str(e)
-                        if "cancel scope" in error_msg.lower():
-                            # CRITICAL: Log cancel scope issues as DEBUG, not ERROR
-                            logger.debug(
-                                f"Cancel scope issue during shutdown (expected): {e}"
-                            )
-                        elif "json object must be str" in error_msg.lower():
-                            # JSON serialization errors are actual bugs
-                            logger.error(
-                                f"JSON serialization error during shutdown: {e}"
-                            )
-                        else:
-                            logger.error(f"Task error during shutdown: {e}")
+                        self._log_shutdown_exc(e)
 
             if self.process and self.process.returncode is None:
                 await self._terminate_process()
@@ -538,6 +500,28 @@ class StdioClient:
 
 
 # ---------------------------------------------------------------------- #
+# Shared helper for context-manager exception handling
+# ---------------------------------------------------------------------- #
+
+
+def _is_benign_shutdown_exc(exc: Exception, context: str) -> bool:
+    """Return True (and log at DEBUG) if *exc* is an expected shutdown artifact.
+
+    Returns False and logs at ERROR for real errors; callers should re-raise.
+    """
+    error_msg = str(exc)
+    if "cancel scope" in error_msg.lower():
+        logger.debug(f"{context}: cancel scope issue during shutdown (expected): {exc}")
+        return True
+    elif "json object must be str" in error_msg.lower():
+        logger.error(f"{context}: JSON serialization error: {exc}")
+        return False
+    else:
+        logger.error(f"{context}: error: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------- #
 # Convenience context-manager that returns streams for send_message
 # ---------------------------------------------------------------------- #
 @asynccontextmanager
@@ -561,34 +545,14 @@ async def stdio_client(
             # Return the streams that send_message expects
             yield client.get_streams()
     except BaseExceptionGroup as eg:
-        # FIXED: Handle exception groups by changing log levels appropriately
         for exc in eg.exceptions:
             if not isinstance(exc, anyio.get_cancelled_exc_class()):
-                error_msg = str(exc)
-                if "cancel scope" in error_msg.lower():
-                    logger.debug(
-                        f"stdio_client cancel scope issue (expected during shutdown): {exc}"
-                    )
-                elif "json object must be str" in error_msg.lower():
-                    logger.error(f"JSON serialization error in stdio_client: {exc}")
-                    raise  # Re-raise JSON errors as they indicate bugs
-                else:
-                    logger.error(f"stdio_client error: {exc}")
-                    raise  # Re-raise non-cancel-scope errors
+                if not _is_benign_shutdown_exc(exc, "stdio_client"):
+                    raise exc
     except Exception as e:
-        # Handle regular exceptions
         if not isinstance(e, anyio.get_cancelled_exc_class()):
-            error_msg = str(e)
-            if "cancel scope" in error_msg.lower():
-                logger.debug(
-                    f"stdio_client cancel scope issue (expected during shutdown): {e}"
-                )
-            elif "json object must be str" in error_msg.lower():
-                logger.error(f"JSON serialization error in stdio_client: {e}")
-                raise  # Re-raise JSON errors as they indicate bugs
-            else:
-                logger.error(f"stdio_client error: {e}")
-                raise  # Re-raise non-cancel-scope errors
+            if not _is_benign_shutdown_exc(e, "stdio_client"):
+                raise
 
 
 @asynccontextmanager
@@ -651,38 +615,14 @@ async def stdio_client_with_initialize(
             yield read_stream, write_stream, init_result
 
     except BaseExceptionGroup as eg:
-        # FIXED: Handle exception groups by changing log levels appropriately
         for exc in eg.exceptions:
             if not isinstance(exc, anyio.get_cancelled_exc_class()):
-                error_msg = str(exc)
-                if "cancel scope" in error_msg.lower():
-                    logger.debug(
-                        f"stdio_client_with_initialize cancel scope issue (expected): {exc}"
-                    )
-                elif "json object must be str" in error_msg.lower():
-                    logger.error(
-                        f"JSON serialization error in stdio_client_with_initialize: {exc}"
-                    )
-                    raise  # Re-raise JSON errors as they indicate bugs
-                else:
-                    logger.error(f"stdio_client_with_initialize error: {exc}")
-                    raise  # Re-raise non-cancel-scope errors
+                if not _is_benign_shutdown_exc(exc, "stdio_client_with_initialize"):
+                    raise exc
     except Exception as e:
-        # Handle regular exceptions
         if not isinstance(e, anyio.get_cancelled_exc_class()):
-            error_msg = str(e)
-            if "cancel scope" in error_msg.lower():
-                logger.debug(
-                    f"stdio_client_with_initialize cancel scope issue (expected): {e}"
-                )
-            elif "json object must be str" in error_msg.lower():
-                logger.error(
-                    f"JSON serialization error in stdio_client_with_initialize: {e}"
-                )
-                raise  # Re-raise JSON errors as they indicate bugs
-            else:
-                logger.error(f"stdio_client_with_initialize error: {e}")
-                raise  # Re-raise non-cancel-scope errors
+            if not _is_benign_shutdown_exc(e, "stdio_client_with_initialize"):
+                raise
 
 
 # ---------------------------------------------------------------------- #

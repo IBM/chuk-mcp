@@ -121,7 +121,9 @@ class TestLoadConfig:
 
         m = mock_open(read_data=json.dumps(config_data))
         with patch("builtins.open", m):
-            with pytest.raises(KeyError):
+            with pytest.raises(
+                ValueError, match="missing the required 'command' field"
+            ):
                 await load_config("config.json", "broken")
 
     @pytest.mark.asyncio

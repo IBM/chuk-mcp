@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chuk-mcp"
-version = "0.9.1"
+version = "0.9.2"
 description = "Model Context Protocol client and server library with optional Pydantic support"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -93,6 +93,13 @@ include = ["chuk_mcp*"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # Python 3.11 asyncio does not always close subprocess transports before the
+    # event loop shuts down.  The resulting __del__ error is a known CPython issue
+    # fixed in 3.12 and is not a bug in this library.
+    "ignore:Exception ignored in.*BaseSubprocessTransport.*:pytest.PytestUnraisableExceptionWarning",
+]
 
 [dependency-groups]
 dev = [

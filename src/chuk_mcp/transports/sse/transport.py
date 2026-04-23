@@ -215,7 +215,8 @@ class SSETransport(Transport):
             self._sse_stream_context = self._stream_client.stream(
                 "GET", sse_endpoint, headers=headers
             )
-            assert self._sse_stream_context is not None
+            if self._sse_stream_context is None:
+                raise RuntimeError("SSE stream context failed to initialise")
 
             # Use configured timeout for the initial connection attempt
             # This ensures we fail fast if the endpoint doesn't exist
@@ -229,7 +230,10 @@ class SSETransport(Transport):
             except asyncio.TimeoutError:
                 raise RuntimeError(f"Timeout connecting to SSE endpoint {sse_endpoint}")
 
-            assert self._sse_response is not None
+            if self._sse_response is None:
+                raise RuntimeError(
+                    "SSE response was not received after connection attempt"
+                )
             if self._sse_response.status_code != 200:
                 raise RuntimeError(
                     f"SSE connection failed with status {self._sse_response.status_code}"
@@ -259,7 +263,10 @@ class SSETransport(Transport):
         current_event = None
         buffer = ""
 
-        assert self._sse_response is not None
+        if self._sse_response is None:
+            raise RuntimeError(
+                "_process_sse_stream called before SSE response was established"
+            )
         async for chunk in self._sse_response.aiter_text():
             if not chunk:
                 continue

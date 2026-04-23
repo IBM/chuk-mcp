@@ -32,6 +32,11 @@ async def load_config(
             raise ValueError(error_msg)
 
         # Construct the server parameters
+        if "command" not in server_config:
+            raise ValueError(
+                f"Server '{server_name}' configuration is missing the required 'command' field."
+            )
+
         result = StdioParameters(
             command=server_config["command"],
             args=server_config.get("args", []),

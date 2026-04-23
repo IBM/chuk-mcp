@@ -902,6 +902,9 @@ class TestRunEntryPoint:
                     with pytest.raises(SystemExit):
                         run()
 
+    # runpy warns that chuk_mcp.__main__ is already in sys.modules (imported at
+    # the top of this file).  The warning is expected and harmless here.
+    @pytest.mark.filterwarnings("ignore:.*found in sys.modules.*:RuntimeWarning")
     def test_main_block_execution(self):
         """Test the if __name__ == '__main__' block."""
         test_args = ["prog", "--config", "test.json"]

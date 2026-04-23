@@ -137,20 +137,41 @@ class TestIsRetryableError:
 class TestIsServerError:
     """Test is_server_error function."""
 
-    def test_server_error_range(self):
-        """Test server errors in range are identified."""
-        # Server error range is -32000 to -32099 (inclusive)
-        # However, the implementation uses <= which is correct
-        # But Python treats -32000 <= -32000 <= -32099 correctly
-        assert is_server_error(-32000) is True
-        assert is_server_error(-32001) is True  # Use -32001 instead of -32050
-        assert is_server_error(-32099) is True
+    def test_server_error_boundaries(self):
+        """Test boundary values of the server error range (-32000 to -32099 inclusive)."""
+        assert is_server_error(SERVER_ERROR_START) is True  # -32000, upper boundary
+        assert is_server_error(SERVER_ERROR_END) is True  # -32099, lower boundary
+        assert is_server_error(-32050) is True  # midpoint
 
-    def test_not_server_error(self):
-        """Test non-server errors are identified."""
-        assert is_server_error(PARSE_ERROR) is False
-        assert is_server_error(INVALID_REQUEST) is False
-        assert is_server_error(-32100) is False
+    def test_server_error_all_mcp_codes(self):
+        """All MCP-specific error codes fall in the server error range."""
+        for code in [
+            CONNECTION_CLOSED,
+            REQUEST_TIMEOUT,
+            MCP_INITIALIZATION_FAILED,
+            MCP_CAPABILITY_NOT_SUPPORTED,
+            MCP_RESOURCE_NOT_FOUND,
+            MCP_TOOL_NOT_FOUND,
+            MCP_PROMPT_NOT_FOUND,
+            MCP_AUTHORIZATION_FAILED,
+            MCP_PROTOCOL_VERSION_MISMATCH,
+        ]:
+            assert is_server_error(code) is True, (
+                f"Expected {code} to be a server error"
+            )
+
+    def test_not_server_error_just_outside_range(self):
+        """Values just outside the range must not be classified as server errors."""
+        assert is_server_error(-32100) is False  # one below SERVER_ERROR_END
+        assert is_server_error(1) is False  # positive number
+
+    def test_not_server_error_standard_jsonrpc(self):
+        """Standard JSON-RPC codes (-32600 to -32700) are outside server error range."""
+        assert is_server_error(PARSE_ERROR) is False  # -32700
+        assert is_server_error(INVALID_REQUEST) is False  # -32600
+        assert is_server_error(INTERNAL_ERROR) is False  # -32603
+
+    def test_not_server_error_zero(self):
         assert is_server_error(0) is False
 
 

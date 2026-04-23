@@ -459,26 +459,31 @@ class TestStdinWriter:
     @pytest.mark.asyncio
     async def test_stdin_writer_other_object(self):
         """Test stdin writer with other object type."""
-        async with StdioClient(
-            StdioParameters(command="echo", args=["test"])
-        ) as client:
-            mock_proc = MagicMock()
-            mock_proc.stdin = AsyncMock()
-            client.process = mock_proc
+        # Manually initialise state so no real subprocess is spawned.
+        # Spawning 'echo test' and then replacing client.process with a mock
+        # left the original transport unreferenced, causing its __del__ to fire
+        # after the event loop closed.
+        params = StdioParameters(command="echo", args=["test"])
+        client = StdioClient(params)
 
-            send_stream, receive_stream = anyio.create_memory_object_stream(1)
-            client._outgoing_recv = receive_stream
+        mock_proc = MagicMock()
+        mock_proc.stdin = AsyncMock()
+        client.process = mock_proc
+        client._streams_initialized = True
 
-            # Send a simple object
-            class SimpleObj:
-                pass
+        send_stream, receive_stream = anyio.create_memory_object_stream(1)
+        client._outgoing_recv = receive_stream
 
-            # This will fail serialization but should be handled
-            await send_stream.send(SimpleObj())
-            await send_stream.aclose()
+        # Send a simple object
+        class SimpleObj:
+            pass
 
-            # Should not raise
-            await client._stdin_writer()
+        # This will fail serialization but should be handled
+        await send_stream.send(SimpleObj())
+        await send_stream.aclose()
+
+        # Should not raise
+        await client._stdin_writer()
 
     @pytest.mark.asyncio
     async def test_stdin_writer_dict_with_method(self):
